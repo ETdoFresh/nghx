@@ -5,7 +5,7 @@ import os from 'node:os';
 
 // Log to stderr to avoid interfering with MCP stdio communication
 const logError = (...args: any[]) => console.error('[nghx-error]', ...args);
-const logInfo = (...args: any[]) => console.info('[nghx-info]', ...args);
+const logInfo = (...args: any[]) => console.log('[nghx-info]', ...args);
 
 // Helper to run commands asynchronously and wait for completion
 function runCommand(command: string, args: string[], cwd: string): Promise<{ code: number | null }> {
