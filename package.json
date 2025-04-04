@@ -1,11 +1,11 @@
 {
-  "name": "nghx-mcp-server",
+  "name": "nghx",
   "version": "1.0.0",
-  "description": "MCP server that runs npx on a GitHub repository.",
+  "description": "Clones a GitHub repo and runs npx within it.",
   "main": "dist/index.js",
   "type": "module",
   "bin": {
-    "nghx-mcp-server": "./dist/index.js"
+    "nghx": "./dist/index.js"
   },
   "scripts": {
     "build": "tsc",
@@ -13,16 +13,12 @@
     "watch": "tsc --watch"
   },
   "keywords": [
-    "mcp",
-    "nghx"
+    "npx",
+    "github"
   ],
   "author": "",
   "license": "ISC",
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.8.0",
-    "zod": "^3.24.2",
-    "zod-to-json-schema": "^3.24.5"
-  },
+  "dependencies": {},
   "devDependencies": {
     "@types/node": "^22.14.0",
     "typescript": "^5.3.3"
