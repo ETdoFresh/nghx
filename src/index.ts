@@ -9,7 +9,7 @@ import { parseGitHubUrl, getCacheDir, prepareRepository, runNpx } from './nghxUt
 
 // Simple logger to stderr
 const logError = (...args: any[]) => console.error('[nghx-error]', ...args);
-const logInfo = (...args: any[]) => console.error('[nghx-info]', ...args);
+const logInfo = (...args: any[]) => console.log('[nghx-info]', ...args);
 
 // Main CLI function
 async function main() {
