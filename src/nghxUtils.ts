@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, SpawnOptions } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
@@ -7,25 +7,16 @@ import os from 'node:os';
 const logError = (...args: any[]) => console.error('[nghx-error]', ...args);
 const logInfo = (...args: any[]) => console.error('[nghx-info]', ...args);
 
-// Helper to run commands asynchronously and capture output
-function runCommand(command: string, args: string[], cwd: string): Promise<{ stdout: string; stderr: string; code: number | null }> {
+// Helper to run commands asynchronously and wait for completion
+function runCommand(command: string, args: string[], cwd: string): Promise<{ code: number | null }> {
     return new Promise((resolve, reject) => {
         logInfo(`Running command: ${command} ${args.join(' ')} in ${cwd}`);
-        const process = spawn(command, args, { cwd, shell: true, stdio: ['ignore', 'pipe', 'pipe'] });
-        let stdout = '';
-        let stderr = '';
-
-        process.stdout?.on('data', (data) => { stdout += data.toString(); });
-        process.stderr?.on('data', (data) => { stderr += data.toString(); });
+        const options: SpawnOptions = { cwd, shell: true, stdio: 'inherit' };
+        const process = spawn(command, args, options);
 
         process.on('close', (code) => {
             logInfo(`Command finished with code ${code}`);
-            if (code === 0) {
-                resolve({ stdout, stderr, code });
-            } else {
-                // Reject with stderr or a generic message
-                 reject(new Error(`Command failed with code ${code}: ${stderr || stdout || 'Unknown error'}`));
-            }
+            resolve({ code });
         });
 
         process.on('error', (err) => {
@@ -116,9 +107,37 @@ async function updateLastPullTime(repoCachePath: string): Promise<void> {
     }
 }
 
-async function getCurrentCommitSha(repoDir: string): Promise<string | null> {
+// Helper function specifically for running commands where output capture is needed (like git rev-parse)
+async function runCommandWithOutput(command: string, args: string[], cwd: string): Promise<{ stdout: string; stderr: string; code: number | null }> {
+    return new Promise((resolve, reject) => {
+        logInfo(`Running command (capture output): ${command} ${args.join(' ')} in ${cwd}`);
+        const process = spawn(command, args, { cwd, shell: true, stdio: ['ignore', 'pipe', 'pipe'] });
+        let stdout = '';
+        let stderr = '';
+
+        process.stdout?.on('data', (data) => { stdout += data.toString(); });
+        process.stderr?.on('data', (data) => { stderr += data.toString(); });
+
+        process.on('close', (code) => {
+            logInfo(`Command (capture output) finished with code ${code}`);
+            if (code === 0 || code === null) {
+                resolve({ stdout, stderr, code });
+            } else {
+                reject(new Error(`Command failed with code ${code}: ${stderr || stdout || 'Unknown error'}`));
+            }
+        });
+
+        process.on('error', (err) => {
+            logError('Spawn error (capture output):', err);
+            reject(err);
+        });
+    });
+}
+
+// Update functions that need output capture to accept the command runner
+async function getCurrentCommitSha(repoDir: string, commandRunner: typeof runCommandWithOutput): Promise<string | null> {
     try {
-        const { stdout } = await runCommand('git', ['rev-parse', 'HEAD'], repoDir);
+        const { stdout } = await commandRunner('git', ['rev-parse', 'HEAD'], repoDir);
         return stdout.trim();
     } catch (error) {
         logError(`Error getting current commit SHA: ${error instanceof Error ? error.message : error}`);
@@ -126,7 +145,7 @@ async function getCurrentCommitSha(repoDir: string): Promise<string | null> {
     }
 }
 
-async function needsDependencyInstallation(npxPath: string, repoDir: string): Promise<boolean> {
+async function needsDependencyInstallation(npxPath: string, repoDir: string, commandRunner: typeof runCommandWithOutput): Promise<boolean> {
     const lastUpdateFile = path.join(npxPath, '.nghx-last-install-sha');
     if (!(await pathExists(lastUpdateFile))) {
         logInfo(`No last install SHA found in ${npxPath}, dependencies need installation.`);
@@ -134,7 +153,7 @@ async function needsDependencyInstallation(npxPath: string, repoDir: string): Pr
     }
     try {
         const lastCommitSha = await fs.readFile(lastUpdateFile, 'utf8');
-        const currentCommitSha = await getCurrentCommitSha(repoDir);
+        const currentCommitSha = await getCurrentCommitSha(repoDir, commandRunner);
 
         if (!currentCommitSha) {
              logInfo(`Could not get current commit SHA for ${repoDir}, assuming dependencies need installation.`);
@@ -150,10 +169,10 @@ async function needsDependencyInstallation(npxPath: string, repoDir: string): Pr
     }
 }
 
-async function updateLastDependencyInstallSha(npxPath: string, repoDir: string): Promise<void> {
+async function updateLastDependencyInstallSha(npxPath: string, repoDir: string, commandRunner: typeof runCommandWithOutput): Promise<void> {
     const lastUpdateFile = path.join(npxPath, '.nghx-last-install-sha');
     try {
-        const currentCommitSha = await getCurrentCommitSha(repoDir);
+        const currentCommitSha = await getCurrentCommitSha(repoDir, commandRunner);
         if (currentCommitSha) {
             await fs.writeFile(lastUpdateFile, currentCommitSha, 'utf8');
             logInfo(`Updated last install SHA in ${lastUpdateFile} to ${currentCommitSha}`);
@@ -165,9 +184,8 @@ async function updateLastDependencyInstallSha(npxPath: string, repoDir: string):
     }
 }
 
-
+// Update prepareRepository to use the correct runners
 export async function prepareRepository(owner: string, repo: string, branch: string, cacheDir: string): Promise<string> {
-    // Use a consistent naming scheme, replacing slashes in branch names if necessary
     const safeBranchName = branch.replace(/\//g, '_');
     const repoCachePath = path.join(cacheDir, owner, repo, safeBranchName);
     logInfo(`Target repository cache directory: ${repoCachePath}`);
@@ -182,48 +200,42 @@ export async function prepareRepository(owner: string, repo: string, branch: str
             return repoCachePath;
         }
         try {
-            await runCommand('git', ['fetch', 'origin', branch], repoCachePath);
-            // Use rev-parse to get the full commit hash of the fetched branch head
-            const { stdout: fetchedCommit } = await runCommand('git', ['rev-parse', `origin/${branch}`], repoCachePath);
+            await runCommand('git', ['fetch', '--depth=1', 'origin', branch], repoCachePath);
+            const { stdout: fetchedCommit } = await runCommandWithOutput('git', ['rev-parse', `origin/${branch}`], repoCachePath);
             await runCommand('git', ['reset', '--hard', fetchedCommit.trim()], repoCachePath);
             logInfo(`Repository updated to origin/${branch}`);
             await updateLastPullTime(repoCachePath);
         } catch (error) {
-            logError(`Failed to update repository: ${error instanceof Error ? error.message : error}. Proceeding with cached version.`);
-            // Optionally delete the potentially corrupted cache and re-clone, or just use the old version
-             // For now, we just log the error and use the cached version
+             logError(`Failed to update repository: ${error instanceof Error ? error.message : error}. Proceeding with cached version.`);
         }
     } else {
         logInfo(`Cloning repository ${cloneUrl} (branch: ${branch})...`);
         try {
-            // Ensure parent directory exists
             await fs.mkdir(path.dirname(repoCachePath), { recursive: true });
-            // Clone specific branch with depth 1 for efficiency, then unshallow if needed later
-            // Using --depth 1 initially might cause issues if npm install needs full history.
-            // Let's try a full clone first. If performance is an issue, revisit shallow clone + unshallow.
-            await runCommand('git', ['clone', '--branch', branch, cloneUrl, repoCachePath], cacheDir); // Run in cacheDir, not repoCachePath
+            await runCommand('git', ['clone', '--branch', branch, '--depth=1', cloneUrl, repoCachePath], cacheDir);
             logInfo('Repository cloned successfully.');
             await updateLastPullTime(repoCachePath);
         } catch (error) {
             logError(`Failed to clone repository: ${error instanceof Error ? error.message : error}`);
-            // Attempt to clean up potentially partially cloned directory
             try {
-                await fs.rm(repoCachePath, { recursive: true, force: true });
+                if (await pathExists(repoCachePath)) {
+                    await fs.rm(repoCachePath, { recursive: true, force: true });
+                }
             } catch (rmError) {
                 logError(`Failed to clean up directory after clone error: ${rmError}`);
             }
-            throw new Error(`Failed to clone repository ${cloneUrl} branch ${branch}`); // Re-throw for MCP handler
+            throw new Error(`Failed to clone repository ${cloneUrl} branch ${branch}`);
         }
     }
     return repoCachePath;
 }
 
-
+// Update runNpx to use correct runners and return only the code
 export async function runNpx(
     npxPath: string,
     args: string[],
     repoDir: string // Pass repoDir for SHA checking
-): Promise<{ stdout: string; stderr: string; code: number | null }> {
+): Promise<{ code: number | null }> {
     logInfo(`Running npx in directory: ${npxPath}`);
     logInfo(`Additional arguments: ${args.length > 0 ? args.join(' ') : '(none)'}`);
 
@@ -231,30 +243,35 @@ export async function runNpx(
         throw new Error(`Target path for npx does not exist: ${npxPath}`);
     }
 
-    // Determine package manager and install command
     let installCommand = 'npm';
-    let installArgs = ['install'];
-    if (await pathExists(path.join(npxPath, 'yarn.lock'))) {
+    let installArgs = ['install', '--prefer-offline', '--no-audit', '--progress=false'];
+    const packageLockPath = path.join(npxPath, 'package-lock.json');
+    const yarnLockPath = path.join(npxPath, 'yarn.lock');
+    const pnpmLockPath = path.join(npxPath, 'pnpm-lock.yaml');
+
+    if (await pathExists(yarnLockPath)) {
         installCommand = 'yarn';
-        installArgs = ['install'];
+        installArgs = ['install', '--frozen-lockfile'];
         logInfo('Detected yarn.lock, using yarn.');
-    } else if (await pathExists(path.join(npxPath, 'pnpm-lock.yaml'))) {
+    } else if (await pathExists(pnpmLockPath)) {
         installCommand = 'pnpm';
-        installArgs = ['install'];
+        installArgs = ['install', '--frozen-lockfile'];
         logInfo('Detected pnpm-lock.yaml, using pnpm.');
+    } else if (await pathExists(packageLockPath)){
+         installCommand = 'npm';
+         installArgs = ['ci', '--prefer-offline', '--no-audit', '--progress=false'];
+         logInfo('Detected package-lock.json, using npm ci.');
     } else {
-        logInfo('No specific lock file detected, using npm.');
+         logInfo('No lock file detected, using npm install.');
     }
 
-    // Check if dependencies need installation
-    if (await needsDependencyInstallation(npxPath, repoDir)) {
+    if (await needsDependencyInstallation(npxPath, repoDir, runCommandWithOutput)) {
          logInfo(`Running dependency installation (${installCommand} ${installArgs.join(' ')})...`);
         try {
             await runCommand(installCommand, installArgs, npxPath);
             logInfo('Dependencies installed successfully.');
-            await updateLastDependencyInstallSha(npxPath, repoDir);
+            await updateLastDependencyInstallSha(npxPath, repoDir, runCommandWithOutput);
         } catch (error) {
-            // Catch install errors
             logError(`Dependency installation failed: ${error instanceof Error ? error.message : error}`);
             throw new Error(`Dependency installation failed in ${npxPath}.`);
         }
@@ -262,8 +279,6 @@ export async function runNpx(
          logInfo('Dependencies appear up-to-date based on commit SHA. Skipping installation.');
     }
 
-    // --- BEGIN MOVED BUILD STEP ---
-    // Run build step AFTER dependency check/install, but before execution command determination
     const packageJsonPathBuildCheck = path.join(npxPath, 'package.json');
     let runBuild = false;
     try {
@@ -288,52 +303,70 @@ export async function runNpx(
              logInfo('Build script completed successfully.');
          } catch (buildError) {
              logError(`Build script failed: ${buildError instanceof Error ? buildError.message : buildError}`);
-             // Decide if failure is critical. For now, log and continue.
          }
     }
-    // --- END MOVED BUILD STEP ---
 
-    // Determine the command to run
     let commandToRun: string;
     let commandArgs: string[];
 
     if (args.length === 0) {
-        // No args provided, try to run the main script from package.json
-        logInfo('No arguments provided, attempting to run main script from package.json...');
+        logInfo('No arguments provided, attempting to run main script or default npx command...');
         const packageJsonPath = path.join(npxPath, 'package.json');
         let mainScript: string | undefined;
+        let binScript: string | Record<string, string> | undefined;
+        let packageName: string | undefined;
         try {
             if (await pathExists(packageJsonPath)) {
                 const packageJsonContent = await fs.readFile(packageJsonPath, 'utf8');
                 const packageJson = JSON.parse(packageJsonContent);
                 mainScript = packageJson.main;
+                binScript = packageJson.bin;
+                packageName = packageJson.name;
             }
         } catch (error) {
             logError(`Error reading or parsing package.json: ${error instanceof Error ? error.message : error}`);
-            // Proceed without main script info
         }
 
-        if (mainScript) {
-            const mainScriptPath = path.resolve(npxPath, mainScript); // Use resolve for safety
-            const mainScriptExists = await pathExists(mainScriptPath);
-            logInfo(`Checking existence of main script: path='${mainScriptPath}', exists=${mainScriptExists}`);
+        let scriptToExecute: string | undefined;
 
-             if (mainScriptExists) {
-                logInfo(`Found main script: ${mainScript}. Running with node.`);
-                commandToRun = 'node';
-                commandArgs = [mainScriptPath];
-            } else {
-                 logInfo(`Main script specified (${mainScript}) but not found at ${mainScriptPath}. Falling back to 'npx .'.`);
-                 commandToRun = 'npx';
-                 commandArgs = ['.'];
+        if (packageName && binScript && typeof binScript === 'object' && binScript[packageName]) {
+            scriptToExecute = binScript[packageName];
+            logInfo(`Found bin script matching package name: ${scriptToExecute}`);
+        } else if (binScript && typeof binScript === 'string') {
+             scriptToExecute = binScript;
+             logInfo(`Found bin script (string): ${scriptToExecute}`);
+        } else if (mainScript) {
+             scriptToExecute = mainScript;
+             logInfo(`Found main script: ${scriptToExecute}`);
+        }
+
+        if (scriptToExecute) {
+             const scriptPath = path.resolve(npxPath, scriptToExecute);
+             const scriptExists = await pathExists(scriptPath);
+             logInfo(`Checking existence of script: path='${scriptPath}', exists=${scriptExists}`);
+
+             if (scriptExists) {
+                 if (scriptToExecute.endsWith('.js') || scriptToExecute.endsWith('.mjs') || scriptToExecute.endsWith('.cjs')) {
+                     logInfo(`Running script with node: ${scriptToExecute}`);
+                     commandToRun = 'node';
+                     commandArgs = [scriptPath];
+                 } else {
+                     logInfo(`Script found (${scriptToExecute}), type unclear. Attempting 'npx .'.`);
+                     commandToRun = 'npx';
+                     commandArgs = ['.'];
+                 }
+             } else {
+                  logInfo(`Script specified (${scriptToExecute}) but not found at ${scriptPath}. Falling back to 'npx .'.`);
+                  commandToRun = 'npx';
+                  commandArgs = ['.'];
              }
         } else {
-            logInfo('No main script found in package.json or package.json missing/invalid. Falling back to \'npx .\'.');
-            commandToRun = 'npx';
-            commandArgs = ['.'];
+             logInfo('No main or bin script found. Falling back to \'npx .\'.');
+             commandToRun = 'npx';
+             commandArgs = ['.'];
         }
+
     } else {
-        // Args provided, run npx with those args
         logInfo('Arguments provided, running npx with specified args.');
         commandToRun = 'npx';
         commandArgs = [...args];
@@ -341,7 +374,6 @@ export async function runNpx(
 
     logInfo(`Executing: ${commandToRun} ${commandArgs.join(' ')} in ${npxPath}`);
     try {
-        // Run the determined command
         const result = await runCommand(commandToRun, commandArgs, npxPath);
         logInfo('Command completed.');
         return result;

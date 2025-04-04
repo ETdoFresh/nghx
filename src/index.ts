@@ -13,8 +13,7 @@ const logInfo = (...args: any[]) => console.error('[nghx-info]', ...args);
 
 // Main CLI function
 async function main() {
-    // Basic argument parsing (adjust as needed for more complex flags)
-    // process.argv contains: [node executable, script path, arg1, arg2, ...]
+    // Basic argument parsing
     const args = process.argv.slice(2);
     if (args.length < 1) {
         logError('Usage: nghx <github_url> [npx_args...]');
@@ -26,7 +25,7 @@ async function main() {
 
     logInfo(`Received URL: ${github_url}`);
     logInfo(`Received NPX Args: ${npxArgs.join(' ')}`);
-    logInfo("Process: Parse URL -> Prepare Repo (clone/update) -> Build (if needed) -> Execute (node main/npx args)");
+    logInfo("Process: Parse URL -> Prepare Repo (clone/update) -> Build (if needed) -> Execute (npx/node)");
 
     try {
         // 1. Parse URL
@@ -34,40 +33,33 @@ async function main() {
 
         // 2. Get/Prepare Cache
         const cacheDir = getCacheDir();
-        // Ensure cache dir exists
-        await fs.mkdir(cacheDir, { recursive: true }); 
+        await fs.mkdir(cacheDir, { recursive: true });
         const repoDir = await prepareRepository(owner, repo, branch, cacheDir);
 
-        // 3. Determine execution path (repo root or subpath)
+        // 3. Determine execution path
         const executionPath = subPath ? path.join(repoDir, subPath) : repoDir;
         logInfo(`Final execution path: ${executionPath}`);
 
         // 4. Run NPX (includes install/build logic)
-        const { stdout, stderr, code } = await runNpx(executionPath, npxArgs, repoDir);
+        // runNpx now returns { code } directly as output is inherited
+        const { code } = await runNpx(executionPath, npxArgs, repoDir);
 
-        // 5. Output results to console
-        if (stdout) {
-            console.log(stdout); // Output stdout to console
-        }
-        if (stderr) {
-            console.error(stderr); // Output stderr to console's stderr
-        }
-
-        // Exit with the same code as the executed process
-        process.exit(code ?? 1); 
+        // 5. Exit with the same code as the executed process
+        logInfo(`Child process exited with code ${code}. Exiting nghx.`);
+        process.exit(code ?? 1); // Exit with the child's code, default to 1 if null
 
     } catch (error: any) {
         logError(`Operation failed: ${error.message}`);
         if (error.stack) {
              console.error(error.stack); // Log stack to stderr for debugging
         }
-        process.exit(1);
+        process.exit(1); // Exit with error code 1 on failure
     }
 }
 
 // Run the main function
 main().catch((error) => {
-    // Catch any unhandled promise rejections from main()
-    logError("Unhandled error during execution:", error);
+    // Catch any unhandled promise rejections from main() itself (should be rare now)
+    logError("Unhandled error during main execution:", error);
     process.exit(1);
 }); 
