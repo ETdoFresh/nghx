@@ -15,8 +15,16 @@ const logInfo = (...args: any[]) => console.log('[nghx-info]', ...args);
 async function main() {
     // Basic argument parsing
     const args = process.argv.slice(2);
+    const noUpdateFlagIndex = args.indexOf('--no-update');
+    const noUpdate = noUpdateFlagIndex !== -1;
+
+    // Remove the flag from the args list if it exists
+    if (noUpdate) {
+        args.splice(noUpdateFlagIndex, 1);
+    }
+
     if (args.length < 1) {
-        logError('Usage: nghx <github_url> [npx_args...]');
+        logError('Usage: nghx [--no-update] <github_url> [npx_args...]');
         process.exit(1);
     }
 
@@ -24,6 +32,7 @@ async function main() {
     const npxArgs = args.slice(1);
 
     logInfo(`Received URL: ${github_url}`);
+    if (noUpdate) logInfo('Running with --no-update flag.');
     logInfo(`Received NPX Args: ${npxArgs.join(' ')}`);
     logInfo("Process: Parse URL -> Prepare Repo (clone/update) -> Build (if needed) -> Execute (npx/node)");
 
@@ -34,7 +43,7 @@ async function main() {
         // 2. Get/Prepare Cache
         const cacheDir = getCacheDir();
         await fs.mkdir(cacheDir, { recursive: true });
-        const repoDir = await prepareRepository(owner, repo, branch, cacheDir);
+        const repoDir = await prepareRepository(owner, repo, branch, cacheDir, noUpdate);
 
         // 3. Determine execution path
         const executionPath = subPath ? path.join(repoDir, subPath) : repoDir;

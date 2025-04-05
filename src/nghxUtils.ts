@@ -184,8 +184,14 @@ async function updateLastDependencyInstallSha(npxPath: string, repoDir: string, 
     }
 }
 
-// Update prepareRepository to use the correct runners
-export async function prepareRepository(owner: string, repo: string, branch: string, cacheDir: string): Promise<string> {
+// Update prepareRepository to use the correct runners and accept the noUpdate flag
+export async function prepareRepository(
+    owner: string,
+    repo: string,
+    branch: string,
+    cacheDir: string,
+    noUpdate: boolean // Add the noUpdate flag
+): Promise<string> {
     const safeBranchName = branch.replace(/\//g, '_');
     const repoCachePath = path.join(cacheDir, owner, repo, safeBranchName);
     logInfo(`Target repository cache directory: ${repoCachePath}`);
@@ -194,6 +200,12 @@ export async function prepareRepository(owner: string, repo: string, branch: str
     const cloneUrl = `https://github.com/${owner}/${repo}.git`;
 
     if (repoExists) {
+        // Check for the --no-update flag first
+        if (noUpdate) {
+            logInfo('Repository exists in cache and --no-update flag specified. Skipping update.');
+            return repoCachePath;
+        }
+
         logInfo('Repository exists in cache. Checking for updates...');
         if (await wasRecentlyPulled(repoCachePath)) {
             logInfo('Repository recently pulled. Skipping update.');
@@ -207,6 +219,8 @@ export async function prepareRepository(owner: string, repo: string, branch: str
             await updateLastPullTime(repoCachePath);
         } catch (error) {
              logError(`Failed to update repository: ${error instanceof Error ? error.message : error}. Proceeding with cached version.`);
+             // Even if update fails, return the existing path
+             return repoCachePath;
         }
     } else {
         logInfo(`Cloning repository ${cloneUrl} (branch: ${branch})...`);
@@ -249,25 +263,28 @@ export async function runNpx(
     const yarnLockPath = path.join(npxPath, 'yarn.lock');
     const pnpmLockPath = path.join(npxPath, 'pnpm-lock.yaml');
 
-    if (await pathExists(yarnLockPath)) {
-        installCommand = 'yarn';
-        installArgs = ['install', '--frozen-lockfile'];
-        logInfo('Detected yarn.lock, using yarn.');
-    } else if (await pathExists(pnpmLockPath)) {
+    if (await pathExists(pnpmLockPath)) {
+        logInfo('Found pnpm-lock.yaml, using pnpm for installation.');
         installCommand = 'pnpm';
-        installArgs = ['install', '--frozen-lockfile'];
-        logInfo('Detected pnpm-lock.yaml, using pnpm.');
-    } else if (await pathExists(packageLockPath)){
-         installCommand = 'npm';
-         installArgs = ['ci', '--prefer-offline', '--no-audit', '--progress=false'];
-         logInfo('Detected package-lock.json, using npm ci.');
+        installArgs = ['install', '--prefer-offline', '--no-frozen-lockfile']; // pnpm might use different flags
+    } else if (await pathExists(yarnLockPath)) {
+        logInfo('Found yarn.lock, using yarn for installation.');
+        installCommand = 'yarn';
+        installArgs = ['install', '--prefer-offline']; // yarn uses different flags
+    } else if (await pathExists(packageLockPath)) {
+        logInfo('Found package-lock.json, using npm ci for installation.');
+        installCommand = 'npm';
+        installArgs = ['ci', '--prefer-offline', '--no-audit', '--progress=false'];
     } else {
-         logInfo('No lock file detected, using npm install.');
+        logInfo('No lockfile found, using npm install.');
+        // Keep default npm install args
     }
 
+    // INSTALL DEPENDENCIES (if needed)
     if (await needsDependencyInstallation(npxPath, repoDir, runCommandWithOutput)) {
          logInfo(`Running dependency installation (${installCommand} ${installArgs.join(' ')})...`);
         try {
+            // Use runCommand for installation steps that don't need output capture
             await runCommand(installCommand, installArgs, npxPath);
             logInfo('Dependencies installed successfully.');
             await updateLastDependencyInstallSha(npxPath, repoDir, runCommandWithOutput);
@@ -279,6 +296,7 @@ export async function runNpx(
          logInfo('Dependencies appear up-to-date based on commit SHA. Skipping installation.');
     }
 
+    // RUN BUILD SCRIPT (if applicable)
     const packageJsonPathBuildCheck = path.join(npxPath, 'package.json');
     let runBuild = false;
     try {
@@ -294,23 +312,28 @@ export async function runNpx(
         }
     } catch(error) {
          logError(`Error checking for build script: ${error instanceof Error ? error.message : error}`);
+         // Decide whether to halt or proceed without building
     }
 
     if (runBuild) {
-         logInfo('Running build script (npm run build)... ');
+         logInfo('Running build script (npm run build)...');
          try {
              await runCommand('npm', ['run', 'build'], npxPath);
              logInfo('Build script completed successfully.');
          } catch (buildError) {
              logError(`Build script failed: ${buildError instanceof Error ? buildError.message : buildError}`);
+             // If build fails, execution likely won't work, so throw an error.
+             throw new Error(`Build script failed in ${npxPath}.`);
          }
     }
 
+    // DETERMINE HOW TO EXECUTE
     let commandToRun: string;
     let commandArgs: string[];
 
     if (args.length === 0) {
-        logInfo('No arguments provided, attempting to run main script or default npx command...');
+        // No arguments passed to nghx itself (beyond the repo URL)
+        logInfo('No specific npx arguments provided, attempting to determine default execution...');
         const packageJsonPath = path.join(npxPath, 'package.json');
         let mainScript: string | undefined;
         let binScript: string | Record<string, string> | undefined;
@@ -322,64 +345,80 @@ export async function runNpx(
                 mainScript = packageJson.main;
                 binScript = packageJson.bin;
                 packageName = packageJson.name;
+                logInfo(`package.json found: main='${mainScript}', bin='${JSON.stringify(binScript)}', name='${packageName}'`);
+            } else {
+                 logInfo('package.json not found in execution directory.');
             }
         } catch (error) {
             logError(`Error reading or parsing package.json: ${error instanceof Error ? error.message : error}`);
+            // Continue and fallback to 'npx .'
         }
 
         let scriptToExecute: string | undefined;
 
+        // Prioritize bin script matching package name
         if (packageName && binScript && typeof binScript === 'object' && binScript[packageName]) {
             scriptToExecute = binScript[packageName];
-            logInfo(`Found bin script matching package name: ${scriptToExecute}`);
+            logInfo(`Using bin script matching package name: ${scriptToExecute}`);
         } else if (binScript && typeof binScript === 'string') {
+             // Use string bin script if available
              scriptToExecute = binScript;
-             logInfo(`Found bin script (string): ${scriptToExecute}`);
+             logInfo(`Using string bin script: ${scriptToExecute}`);
         } else if (mainScript) {
+             // Fallback to main script
              scriptToExecute = mainScript;
-             logInfo(`Found main script: ${scriptToExecute}`);
+             logInfo(`Using main script: ${scriptToExecute}`);
         }
 
         if (scriptToExecute) {
-             const scriptPath = path.resolve(npxPath, scriptToExecute);
-             const scriptExists = await pathExists(scriptPath);
-             logInfo(`Checking existence of script: path='${scriptPath}', exists=${scriptExists}`);
+             const scriptFullPath = path.resolve(npxPath, scriptToExecute);
+             const scriptExists = await pathExists(scriptFullPath);
+             logInfo(`Resolved script path: '${scriptFullPath}', Exists: ${scriptExists}`);
 
              if (scriptExists) {
+                 // Basic check if it looks runnable by node
                  if (scriptToExecute.endsWith('.js') || scriptToExecute.endsWith('.mjs') || scriptToExecute.endsWith('.cjs')) {
-                     logInfo(`Running script with node: ${scriptToExecute}`);
+                     logInfo(`Executing main/bin script directly with node.`);
                      commandToRun = 'node';
-                     commandArgs = [scriptPath];
+                     commandArgs = [scriptFullPath]; // Pass the resolved path
                  } else {
-                     logInfo(`Script found (${scriptToExecute}), type unclear. Attempting 'npx .'.`);
+                     // If not obviously a JS file, assume it's an executable script or rely on npx's bin handling
+                     logInfo(`Script type unclear or not a .js file. Using 'npx .' to execute the package's defined binary.`);
                      commandToRun = 'npx';
+                     // npx . should correctly pick up the bin script defined in package.json
                      commandArgs = ['.'];
                  }
              } else {
-                  logInfo(`Script specified (${scriptToExecute}) but not found at ${scriptPath}. Falling back to 'npx .'.`);
+                  logInfo(`Specified script '${scriptToExecute}' not found at '${scriptFullPath}'. Falling back to 'npx .'.`);
                   commandToRun = 'npx';
                   commandArgs = ['.'];
              }
         } else {
-             logInfo('No main or bin script found. Falling back to \'npx .\'.');
+             // Ultimate fallback if no specific script could be determined
+             logInfo(`No main or bin script could be determined. Falling back to 'npx .' which might execute the default binary.`);
              commandToRun = 'npx';
              commandArgs = ['.'];
         }
 
     } else {
-        logInfo('Arguments provided, running npx with specified args.');
+        // Arguments were passed to nghx
+        logInfo(`NPX arguments provided ('${args.join(' ')}'). Executing package via 'npx .' with these arguments.`);
         commandToRun = 'npx';
-        commandArgs = [...args];
+        // Prepend '.' to target the local directory, followed by user args
+        commandArgs = ['.', ...args];
     }
 
-    logInfo(`Executing: ${commandToRun} ${commandArgs.join(' ')} in ${npxPath}`);
+    // EXECUTE THE COMMAND
+    logInfo(`Final execution command: ${commandToRun} ${commandArgs.join(' ')} in ${npxPath}`);
     try {
+        // Use runCommand which inherits stdio and returns the exit code
         const result = await runCommand(commandToRun, commandArgs, npxPath);
-        logInfo('Command completed.');
-        return result;
+        logInfo(`Execution finished with code ${result.code}.`);
+        return result; // Return the { code } object
     } catch (error) {
          logError(`Execution failed: ${error instanceof Error ? error.message : error}`);
+         // Re-throw the error to be caught by the main function
          if (error instanceof Error) throw error;
-         else throw new Error('Execution failed with unknown error');
+         else throw new Error('Execution failed with an unknown error.');
     }
 } 
