@@ -10,6 +10,8 @@ To install `nghx` globally, you can clone the repository and install from the lo
 # Install from a local clone
 git clone https://github.com/ETdoFresh/nghx.git
 cd nghx
+npm install
+npm run build
 npm install -g .
 ```
 
